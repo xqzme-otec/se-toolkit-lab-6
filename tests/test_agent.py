@@ -67,3 +67,14 @@ def test_list_wiki():
     # Should have used list_files
     tools_used = [t['tool'] for t in output['tool_calls']]
     assert 'list_files' in tools_used
+def test_backend_framework():
+    result = subprocess.run([sys.executable, 'agent.py', 'What framework does the backend use?'], capture_output=True, text=True)
+    output = json.loads(result.stdout)
+    assert 'FastAPI' in output['answer']
+    assert any(t['tool'] == 'read_file' for t in output['tool_calls'])
+
+def test_item_count():
+    result = subprocess.run([sys.executable, 'agent.py', 'How many items are in the database?'], capture_output=True, text=True)
+    output = json.loads(result.stdout)
+    assert any(t['tool'] == 'query_api' for t in output['tool_calls'])
+    assert '0' in output['answer'] or 'items' in output['answer']
