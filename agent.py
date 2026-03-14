@@ -2,7 +2,7 @@
 """
 Agent CLI - Task 3: System Agent with query_api tool
 """
-
+import time
 import os
 import sys
 import json
@@ -71,10 +71,10 @@ def query_api(method="GET", path="/", body=None, auth=True):
         return "Error: LMS_API_KEY not configured"
     try:
         if method.upper() == "GET":
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, headers=headers, timeout=20)
         elif method.upper() == "POST":
             data = json.loads(body) if body else {}
-            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response = requests.post(url, headers=headers, json=data, timeout=20)
         else:
             return f"Unsupported method: {method}"
         return json.dumps({'status_code': response.status_code, 'body': response.text})
@@ -230,7 +230,9 @@ Example: "How many items are currently stored in the database?"
 2. Parse the response body - it's a JSON array: [] or [{"id":1}, ...]
 3. Count the items in the array
 4. Answer: [API] There are X items in the database. (source optional)
-
+✅ CORRECT:
+[API] There are 0 items in the database. I queried /items/ and got an empty array.
+[API] There are 3 items in the database. I queried /items/ and got [{"id":1},...].
 ### QUESTION 6: Status codes without auth
 Example: "What HTTP status code does the API return when you request /items/ without sending an authentication header?"
 1. query_api('GET', '/items/', auth=false) - call without auth header
@@ -317,7 +319,7 @@ def call_llm_with_tools(messages, config, tools=None):
             f'{config["llm_api_base"]}/chat/completions',
             headers=headers,
             json=payload,
-            timeout=60
+            timeout=180
         )
         response.raise_for_status()
         return response.json()
@@ -325,7 +327,7 @@ def call_llm_with_tools(messages, config, tools=None):
         print(f'Error calling LLM: {e}', file=sys.stderr)
         return None
 
-def agent_loop(question, config, max_iterations=15):
+def agent_loop(question, config, max_iterations=22):
     messages = [
         {'role': 'system', 'content': SYSTEM_PROMPT},
         {'role': 'user', 'content': question}
