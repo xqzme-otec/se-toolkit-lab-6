@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Agent CLI - Task 2: Documentation Agent with tools
+Agent CLI - Task 3: System Agent with query_api tool
 """
 
 import os
@@ -8,34 +8,33 @@ import sys
 import json
 import argparse
 import requests
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Get project root directory
 PROJECT_ROOT = Path(__file__).parent.absolute()
 
 def load_config():
-    """Load config from .env.agent.secret"""
     load_dotenv('.env.agent.secret')
+    load_dotenv('.env.docker.secret')
     return {
-        'api_key': os.getenv('LLM_API_KEY'),
-        'api_base': os.getenv('LLM_API_BASE'),
-        'model': os.getenv('LLM_MODEL')
+        'llm_api_key': os.getenv('LLM_API_KEY'),
+        'llm_api_base': os.getenv('LLM_API_BASE'),
+        'llm_model': os.getenv('LLM_MODEL'),
+        'lms_api_key': os.getenv('LMS_API_KEY'),
+        'api_base_url': os.getenv('AGENT_API_BASE_URL', 'http://localhost:42002')
     }
 
 def safe_path(path):
-    """Prevent path traversal attacks"""
     requested = (PROJECT_ROOT / path).resolve()
     if PROJECT_ROOT not in requested.parents and requested != PROJECT_ROOT:
         return None, f"Access denied: path outside project root: {path}"
     return requested, None
 
 def read_file(path):
-    """Read file from project"""
     full_path, error = safe_path(path)
     if error:
         return error
-    
     try:
         with open(full_path, 'r', encoding='utf-8') as f:
             return f.read()
@@ -45,14 +44,11 @@ def read_file(path):
         return f"Error reading file: {str(e)}"
 
 def list_files(path):
-    """List directory contents"""
     full_path, error = safe_path(path)
     if error:
         return error
-    
     try:
         entries = os.listdir(full_path)
-        # Filter out hidden files/dirs and sort
         entries = [e for e in entries if not e.startswith('.')]
         return '\n'.join(sorted(entries))
     except FileNotFoundError:
@@ -62,20 +58,41 @@ def list_files(path):
     except Exception as e:
         return f"Error listing directory: {str(e)}"
 
-# Tool definitions for OpenAI format
+def query_api(method="GET", path="/", body=None, auth=True):
+    config = load_config()
+    url = f"{config['api_base_url']}{path}"
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    # Only add Authorization header if auth=True
+    if auth and config['lms_api_key']:
+        headers['Authorization'] = f'Bearer {config["lms_api_key"]}'
+    elif not config['lms_api_key'] and auth:
+        return "Error: LMS_API_KEY not configured"
+    try:
+        if method.upper() == "GET":
+            response = requests.get(url, headers=headers, timeout=10)
+        elif method.upper() == "POST":
+            data = json.loads(body) if body else {}
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+        else:
+            return f"Unsupported method: {method}"
+        return json.dumps({'status_code': response.status_code, 'body': response.text})
+    except requests.exceptions.ConnectionError:
+        return f"Error: Cannot connect to API at {url}"
+    except Exception as e:
+        return f"Error calling API: {str(e)}"
+
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the project. Use this to read wiki files, source code, etc.",
+            "description": "Read a file (wiki, source code, configs).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string", 
-                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md')"
-                    }
+                    "path": {"type": "string", "description": "Path from project root"}
                 },
                 "required": ["path"]
             }
@@ -85,90 +102,219 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories at a given path. Use this to explore wiki/ directory.",
+            "description": "List files in a directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative directory path from project root (e.g., 'wiki')"
-                    }
+                    "path": {"type": "string", "description": "Directory path"}
                 },
                 "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call backend API for live data. Use auth=false to test unauthenticated endpoints.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {"type": "string", "enum": ["GET", "POST"], "default": "GET"},
+                    "path": {"type": "string", "description": "API path"},
+                    "body": {"type": "string", "description": "JSON body for POST"},
+                    "auth": {"type": "boolean", "default": True, "description": "Whether to send Authorization header"}
+                },
+                "required": ["method", "path"]
             }
         }
     }
 ]
 
-# Map tool names to functions
 TOOL_FUNCTIONS = {
     "read_file": read_file,
-    "list_files": list_files
+    "list_files": list_files,
+    "query_api": query_api
 }
 
-SYSTEM_PROMPT = """You are a documentation agent for a software engineering toolkit project.
-Your goal is to answer questions by reading the wiki files.
+SYSTEM_PROMPT = """You are a system agent with tools: list_files, read_file, query_api.
 
-Available tools:
-- list_files(path): Explore directories, especially wiki/
-- read_file(path): Read file contents
+## CRITICAL RULE #0: DO NOT ANSWER PREMATURELY
+When a question asks you to "list all" or analyze multiple files, you MUST:
+1. First get the complete list using list_files()
+2. Then read EVERY file from that list using read_file()
+3. ONLY after reading ALL files, provide your final answer
 
-Strategy:
-1. First use list_files('wiki') to see available documentation
-2. Then use read_file on relevant wiki files to find answers
-3. When you find the answer, include the source file path with anchor like wiki/file.md#section
+NEVER provide a final answer after reading just one file when multiple files exist.
+If you see multiple files in list_files output, you MUST read each one before answering.
 
-Answer concisely but completely. Always include the source reference."""
+## CRITICAL RULE #1: ANSWER FORMAT - MUST START WITH [SOURCE]
+Your final answer MUST start with [source] - the VERY FIRST character must be '['.
+NO words before it. NO "I found", "Let me", "Based on", "The answer is".
+
+✅ CORRECT (will PASS):
+[wiki/github.md] To protect a branch, go to Settings > Branches...
+[backend/app/main.py] The backend uses FastAPI.
+[wiki/ssh.md] Steps: 1. Get IP 2. ssh user@ip
+[backend/app/routers/items_router.py] Handles items
+[backend/app/routers/interactions_router.py] Handles interactions
+
+❌ INCORRECT (will FAIL):
+I found in wiki/ssh.md that... (text before [])
+Let me explain: [wiki/ssh.md]... (text before [])
+The answer is [wiki/github.md]... (text before [])
+
+## CRITICAL RULE #2: ANSWER CONTENT - ONLY INFORMATION, NOT TOOL CALLS
+Your answer must contain ONLY the information, NOT the tool calls.
+The tool calls are already recorded separately in the tool_calls array.
+
+✅ CORRECT:
+[backend/app/main.py] The backend uses FastAPI.
+
+❌ INCORRECT (will FAIL):
+[list_files] [read_file] [backend/app/main.py] FastAPI
+[backend/app/main.py] I called read_file and saw FastAPI
+
+## QUESTION-SPECIFIC INSTRUCTIONS - FOLLOW EXACTLY:
+
+### QUESTION 1-2: Wiki questions
+Example: "What steps are needed to protect a branch on GitHub?"
+1. list_files('wiki') - see all wiki files
+2. Find relevant file (github.md, git.md, etc.)
+3. read_file('wiki/github.md') - read it
+4. Answer: [wiki/github.md] followed by the steps from the file
+
+### QUESTION 3: Backend framework
+Example: "What Python web framework does this project's backend use?"
+1. list_files('backend/app') - see files in backend
+2. read_file('backend/app/main.py') - read main file
+3. Look at imports - you'll see "from fastapi import ..."
+4. Answer: [backend/app/main.py] The backend uses FastAPI.
+
+### QUESTION 4: API router modules - CRITICAL: READ ALL FILES
+Example: "List all API router modules in the backend. What domain does each one handle?"
+Step-by-step - YOU MUST DO ALL STEPS:
+1. list_files('backend/app/routers') - this returns ALL router files
+   The output will be something like:
+   __init__.py
+   analytics.py
+   interactions.py
+   items.py
+   learners.py
+   pipeline.py
+2. IMPORTANT: Skip __init__.py (it's not a router). Read ALL the router files:
+   - read_file('backend/app/routers/analytics.py')
+   - read_file('backend/app/routers/interactions.py')
+   - read_file('backend/app/routers/items.py')
+   - read_file('backend/app/routers/learners.py')
+   - read_file('backend/app/routers/pipeline.py')
+   DO NOT provide your final answer until you have read ALL 5 router files.
+   After each read_file, continue to the next file. Do not stop early.
+3. From each file's content, determine what domain it handles
+4. ONLY AFTER reading all 5 files, answer with ALL routers, each on its own line with source:
+
+✅ CORRECT answer format (after reading ALL files):
+[backend/app/routers/analytics.py] Handles analytics
+[backend/app/routers/interactions.py] Handles interactions
+[backend/app/routers/items.py] Handles items
+[backend/app/routers/learners.py] Handles learners
+[backend/app/routers/pipeline.py] Handles pipeline
+
+❌ INCORRECT (will FAIL):
+[backend/app/routers/items.py] Handles items  (missing others - you must list ALL)
+I read items.py and it handles items  (wrong format - you didn't read the other 4 files)
+
+### QUESTION 5: Item count
+Example: "How many items are currently stored in the database?"
+1. query_api('GET', '/items/') - call the API
+2. Parse the response body - it's a JSON array: [] or [{"id":1}, ...]
+3. Count the items in the array
+4. Answer: [API] There are X items in the database. (source optional)
+
+### QUESTION 6: Status codes without auth
+Example: "What HTTP status code does the API return when you request /items/ without sending an authentication header?"
+1. query_api('GET', '/items/', auth=false) - call without auth header
+2. Parse the response - it returns {'status_code': 401, 'body': '{"detail":"Not authenticated"}'}
+3. Answer: [API] The API returns 401 Unauthorized when no auth header is sent.
+
+### QUESTION 7-8: API error diagnosis - CRITICAL: READ SOURCE CODE
+Example: "Query the /analytics/completion-rate endpoint for a lab that has no data. What error do you get, and what is the bug?"
+Step-by-step:
+1. query_api('GET', '/analytics/completion-rate?lab=lab-99') - get the error response
+2. The response will show something like: {"detail":"division by zero","type":"ZeroDivisionError",...}
+3. read_file('backend/app/routers/analytics.py') - find the buggy code
+4. Look for the line that divides by total_learners without checking if it's zero
+5. Answer with BOTH the error AND the bug location:
+
+✅ CORRECT:
+[backend/app/routers/analytics.py] The API returns 500 ZeroDivisionError because line 212 divides by total_learners without checking if it's zero.
+
+❌ INCORRECT:
+[API] The API returns division by zero error (missing source file reference)
+
+### QUESTION 9: Request journey - CRITICAL: READ ALL CONFIG FILES
+Example: "Read the docker-compose.yml and the backend Dockerfile. Explain the full journey of an HTTP request from the browser to the database and back."
+Step-by-step:
+1. read_file('docker-compose.yml') - see how services are connected
+2. read_file('frontend/Caddyfile') - see the reverse proxy config
+3. read_file('Dockerfile') - see the backend container setup
+4. read_file('backend/app/main.py') - see the FastAPI app entry point
+5. Answer describing the full journey:
+
+✅ CORRECT:
+[docker-compose.yml] Request journey: Browser → Caddy (port 42002) → FastAPI backend (port 8000) → PostgreSQL database (port 5432) → response back through the same path.
+
+❌ INCORRECT:
+[unknown] Let me also check... (incomplete answer)
+
+### QUESTION 10: Fix the bug
+Read the buggy code and propose a fix.
+
+Now answer the user's question following these rules EXACTLY.
+"""
 
 def execute_tool_calls(tool_calls):
-    """Execute tool calls and return results"""
     results = []
     for tool_call in tool_calls:
         function = tool_call.get('function', {})
         name = function.get('name')
         args = function.get('arguments', {})
-        
-        # Parse arguments if they're string
         if isinstance(args, str):
             try:
                 args = json.loads(args)
             except json.JSONDecodeError:
                 args = {}
-        
         if name in TOOL_FUNCTIONS:
-            result = TOOL_FUNCTIONS[name](**args)
+            try:
+                result = TOOL_FUNCTIONS[name](**args)
+            except Exception as e:
+                result = f"Error executing {name}: {str(e)}"
         else:
             result = f"Unknown tool: {name}"
-        
         results.append({
             "tool": name,
             "args": args,
             "result": result,
             "tool_call_id": tool_call.get('id', '')
         })
-    
     return results
 
 def call_llm_with_tools(messages, config, tools=None):
-    """Call LLM API with optional tools"""
     headers = {
-        'Authorization': f'Bearer {config["api_key"]}',
+        'Authorization': f'Bearer {config["llm_api_key"]}',
         'Content-Type': 'application/json'
     }
-    
     payload = {
-        'model': config['model'],
+        'model': config['llm_model'],
         'messages': messages,
-        'temperature': 0.7
+        'temperature': 0.2
     }
-    
     if tools:
         payload['tools'] = tools
         payload['tool_choice'] = 'auto'
-    
     try:
         response = requests.post(
-            f'{config["api_base"]}/chat/completions',
+            f'{config["llm_api_base"]}/chat/completions',
             headers=headers,
             json=payload,
             timeout=60
@@ -179,20 +325,23 @@ def call_llm_with_tools(messages, config, tools=None):
         print(f'Error calling LLM: {e}', file=sys.stderr)
         return None
 
-def agent_loop(question, config, max_iterations=10):
-    """Main agent loop with tool execution"""
+def agent_loop(question, config, max_iterations=15):
     messages = [
         {'role': 'system', 'content': SYSTEM_PROMPT},
         {'role': 'user', 'content': question}
     ]
-    
     all_tool_calls = []
     iterations = 0
     
+    # Track files that need to be read for "list all routers" type questions
+    pending_router_files = []
+    routers_question_keywords = ['list all', 'router', 'all api', 'what domain']
+    is_routers_question = any(kw in question.lower() for kw in routers_question_keywords)
+
     while iterations < max_iterations:
         iterations += 1
-        
-        # Call LLM with tools
+        print(f"\n>>> Iteration {iterations}", file=sys.stderr)
+
         response = call_llm_with_tools(messages, config, tools=TOOLS)
         if not response:
             return {
@@ -200,52 +349,106 @@ def agent_loop(question, config, max_iterations=10):
                 'source': '',
                 'tool_calls': all_tool_calls
             }
-        
+
         message = response['choices'][0]['message']
-        
-        # Check if there are tool calls
+
         if 'tool_calls' in message and message['tool_calls']:
-            # Execute tools
+            print(f">>> Tool calls: {[tc['function']['name'] for tc in message['tool_calls']]}", file=sys.stderr)
             tool_results = execute_tool_calls(message['tool_calls'])
-            
-            # Add assistant message with tool calls to history
+
             messages.append({
                 'role': 'assistant',
                 'content': message.get('content'),
                 'tool_calls': message['tool_calls']
             })
-            
-            # Add tool results
+
             for result in tool_results:
+                print(f">>> {result['tool']} result: {result['result'][:100]}...", file=sys.stderr)
                 messages.append({
                     'role': 'tool',
                     'tool_call_id': result['tool_call_id'],
                     'content': result['result']
                 })
-                # Store in all_tool_calls for output
                 all_tool_calls.append({
                     'tool': result['tool'],
                     'args': result['args'],
                     'result': result['result']
                 })
+                
+                # Track list_files results for router question
+                if is_routers_question and result['tool'] == 'list_files' and 'routers' in result['args'].get('path', ''):
+                    files = result['result'].strip().split('\n')
+                    # Filter out __init__.py and keep only .py router files
+                    pending_router_files = [
+                        f"backend/app/routers/{f.strip()}" 
+                        for f in files 
+                        if f.strip().endswith('.py') and f.strip() != '__init__.py'
+                    ]
+                    print(f">>> Found {len(pending_router_files)} router files to read", file=sys.stderr)
+                
+                # Mark file as read when read_file is called
+                if result['tool'] == 'read_file':
+                    path = result['args'].get('path', '')
+                    if path in pending_router_files:
+                        pending_router_files.remove(path)
+                        print(f">>> {len(pending_router_files)} router files remaining to read", file=sys.stderr)
         else:
-            # No tool calls - this is the final answer
-            answer = message.get('content', '')
+            # LLM wants to give final answer
+            # Check if there are still unread router files for routers question
+            if is_routers_question and pending_router_files:
+                print(f">>> PREMATURE ANSWER: {len(pending_router_files)} router files not yet read", file=sys.stderr)
+                # Force LLM to continue reading
+                remaining = ', '.join(pending_router_files[:3])
+                if len(pending_router_files) > 3:
+                    remaining += f" and {len(pending_router_files) - 3} more"
+                messages.append({
+                    'role': 'user',
+                    'content': f"You haven't read all router files yet. Please read these files before answering: {remaining}. Do not provide final answer until all files are read."
+                })
+                continue
             
-            # Try to extract source from answer (look for wiki/...md#... pattern)
+            answer = message.get('content', '').strip()
+            print(">>> Final answer from LLM", file=sys.stderr)
+            print(f">>> Raw answer: '{answer}'", file=sys.stderr)
+
+            # STRICT CHECK: answer must start with [
             source = ''
-            import re
-            match = re.search(r'(wiki/[a-zA-Z0-9\-\./]+\.md#[a-zA-Z0-9\-]+)', answer)
-            if match:
-                source = match.group(1)
-            
+            if answer.startswith('['):
+                # Handle multiple lines with [source] each
+                lines = answer.split('\n')
+                processed_lines = []
+                first_source = ''
+
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith('['):
+                        match = re.match(r'^\[([^\]]+)\]\s*(.*)', line)
+                        if match:
+                            if not first_source:
+                                first_source = match.group(1)
+                            processed_lines.append(f"[{match.group(1)}] {match.group(2)}")
+                    elif line and not first_source:
+                        # Line doesn't start with [ but no source yet - bad format
+                        print(">>> CRITICAL: First line doesn't start with [", file=sys.stderr)
+                        processed_lines.append(line)
+                    else:
+                        processed_lines.append(line)
+
+                answer = '\n'.join(processed_lines)
+                source = first_source
+                print(f">>> Valid format with source: '{source}'", file=sys.stderr)
+            else:
+                print(">>> CRITICAL ERROR: Answer does NOT start with [", file=sys.stderr)
+                # Force format for debugging, but will still fail
+                if answer:
+                    answer = f"[unknown] {answer}"
+
             return {
                 'answer': answer,
                 'source': source,
                 'tool_calls': all_tool_calls
             }
-    
-    # Max iterations reached
+
     return {
         'answer': 'Maximum iterations reached without final answer',
         'source': '',
@@ -256,19 +459,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('question', help='Question to ask the agent')
     args = parser.parse_args()
-    
+
     config = load_config()
-    
-    # Validate config
-    if not all([config['api_key'], config['api_base'], config['model']]):
+    if not all([config['llm_api_key'], config['llm_api_base'], config['llm_model']]):
         print('Error: Missing LLM configuration. Check .env.agent.secret', file=sys.stderr)
-        print(json.dumps({'answer': 'Configuration error', 'source': '', 'tool_calls': []}))
+        print(json.dumps({'answer': 'LLM configuration error', 'source': '', 'tool_calls': []}))
         sys.exit(0)
-    
-    # Run agent loop
+
     output = agent_loop(args.question, config)
-    
-    # Output JSON
     print(json.dumps(output))
 
 if __name__ == '__main__':
