@@ -21,4 +21,49 @@ def test_agent_basic_call():
     assert isinstance(output['answer'], str)
     assert 'tool_calls' in output
     assert isinstance(output['tool_calls'], list)
-    assert len(output['tool_calls']) == 0
+
+def test_merge_conflict():
+    """Test that agent finds merge conflict info in wiki"""
+    result = subprocess.run(
+        [sys.executable, 'agent.py', 'How do you resolve a merge conflict?'],
+        capture_output=True,
+        text=True
+    )
+    
+    assert result.returncode == 0
+    
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        assert False, f'Invalid JSON output: {result.stdout}'
+    
+    assert 'answer' in output
+    assert 'source' in output
+    assert 'wiki/git.md' in output['source'] or 'wiki/git-workflow.md' in output['source']
+    assert len(output['tool_calls']) > 0
+    
+    # Check that tool calls include read_file
+    tools_used = [t['tool'] for t in output['tool_calls']]
+    assert 'read_file' in tools_used
+
+def test_list_wiki():
+    """Test that agent can list wiki files"""
+    result = subprocess.run(
+        [sys.executable, 'agent.py', 'What files are in the wiki directory?'],
+        capture_output=True,
+        text=True
+    )
+    
+    assert result.returncode == 0
+    
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        assert False, f'Invalid JSON output: {result.stdout}'
+    
+    assert 'answer' in output
+    assert len(output['tool_calls']) > 0
+    
+    # Should have used list_files
+    tools_used = [t['tool'] for t in output['tool_calls']]
+    assert 'list_files' in tools_used
